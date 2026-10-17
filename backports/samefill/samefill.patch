@@ -1,0 +1,25 @@
+diff --git a/drivers/block/zram/zram_drv.c b/drivers/block/zram/zram_drv.c
+index 1977f15ba..227d56251 100644
+--- a/drivers/block/zram/zram_drv.c
++++ b/drivers/block/zram/zram_drv.c
+@@ -215,14 +215,18 @@ static inline void zram_fill_page(char *ptr, unsigned long len,
+ 
+ static bool page_same_filled(void *ptr, unsigned long *element)
+ {
+-	unsigned int pos;
++	unsigned int pos, last_pos = PAGE_SIZE / sizeof(unsigned long) - 1;
+ 	unsigned long *page;
+ 	unsigned long val;
+ 
+ 	page = (unsigned long *)ptr;
+ 	val = page[0];
+ 
+-	for (pos = 1; pos < PAGE_SIZE / sizeof(*page); pos++) {
++	/* KKNX (Linux 5.4): последнее слово различается чаще всего, выходим сразу */
++	if (val != page[last_pos])
++		return false;
++
++	for (pos = 1; pos < last_pos; pos++) {
+ 		if (val != page[pos])
+ 			return false;
+ 	}

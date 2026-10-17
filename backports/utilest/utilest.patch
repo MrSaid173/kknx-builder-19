@@ -1,0 +1,197 @@
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -1422,10 +1422,22 @@
+  * Then it is the load_weight's responsibility to consider overflow
+  * issues.
+  */
++/*
++ * util_est (Linux 4.17): оценка загрузки по прошлым активациям задачи.
++ * @enqueued: у задачи - загрузка на момент последней записи; у корневого cfs_rq - сумма оценок поставленных в очередь задач
++ * @ewma:     у задачи - скользящее среднее загрузки по активациям
++ */
++struct util_est {
++	unsigned int			enqueued;
++	unsigned int			ewma;
++#define UTIL_EST_WEIGHT_SHIFT		2
++};
++
+ struct sched_avg {
+ 	u64 last_update_time, load_sum;
+ 	u32 util_sum, period_contrib;
+ 	unsigned long load_avg, util_avg;
++	struct util_est util_est;
+ };
+ 
+ #ifdef CONFIG_SCHEDSTATS
+diff --git a/include/linux/sched/sysctl.h b/include/linux/sched/sysctl.h
+--- a/include/linux/sched/sysctl.h
++++ b/include/linux/sched/sysctl.h
+@@ -24,6 +24,9 @@
+ extern unsigned int sysctl_sched_cstate_aware;
+ extern unsigned int sysctl_sched_capacity_margin;
+ extern unsigned int sysctl_sched_capacity_margin_down;
++#ifdef CONFIG_SMP
++extern unsigned int sysctl_sched_util_est;
++#endif
+ 
+ #ifdef CONFIG_SCHED_WALT
+ extern unsigned int sysctl_sched_init_task_load_pct;
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -153,6 +153,10 @@
+ unsigned int sysctl_sched_use_walt_cpu_util = 1;
+ unsigned int sysctl_sched_use_walt_task_util = 1;
+ #endif
++#ifdef CONFIG_SMP
++/* util_est (4.17): учитывать ли оценку по прошлым активациям при выборе частоты (0 = только PELT как раньше) */
++unsigned int sysctl_sched_util_est = 1;
++#endif
+ /*
+  * The initial- and re-scaling of tunables is configurable
+  * (default SCHED_TUNABLESCALING_LOG = *(1+ilog(ncpus))
+@@ -824,6 +828,8 @@
+ 	struct sched_avg *sa = &se->avg;
+ 
+ 	sa->last_update_time = 0;
++	sa->util_est.enqueued = 0;
++	sa->util_est.ewma = 0;
+ 	/*
+ 	 * sched_avg's period_contrib should be strictly less then 1024, so
+ 	 * we give it 1023 to make sure it is almost a period (1024us), and
+@@ -5022,6 +5028,70 @@
+ static unsigned long cpu_util(int cpu);
+ #endif
+ 
++#ifdef CONFIG_SMP
++/*
++ * util_est: бэкпорт Linux 4.17 ("sched/fair: Add util_est on top of PELT"), вариант 5.x:
++ * вычитание при dequeue до пересчёта частоты, обновление скользящего среднего после.
++ * Учёт ведётся всегда; sysctl sched_util_est только решает, читает ли его schedutil.
++ */
++static inline unsigned long _task_util_est(struct task_struct *p)
++{
++	unsigned int ewma = READ_ONCE(p->se.avg.util_est.ewma);
++	unsigned int enq = READ_ONCE(p->se.avg.util_est.enqueued);
++
++	return max(ewma, enq);
++}
++
++static inline bool util_est_within_margin(int value, int margin)
++{
++	return ((unsigned int)(value + margin - 1) < (2 * margin - 1));
++}
++
++static inline void util_est_enqueue(struct cfs_rq *cfs_rq, struct task_struct *p)
++{
++	unsigned int enqueued = cfs_rq->avg.util_est.enqueued;
++
++	enqueued += _task_util_est(p);
++	WRITE_ONCE(cfs_rq->avg.util_est.enqueued, enqueued);
++}
++
++static inline void util_est_dequeue(struct cfs_rq *cfs_rq, struct task_struct *p)
++{
++	unsigned int enqueued = cfs_rq->avg.util_est.enqueued;
++
++	enqueued -= min_t(unsigned int, enqueued, _task_util_est(p));
++	WRITE_ONCE(cfs_rq->avg.util_est.enqueued, enqueued);
++}
++
++static inline void util_est_update(struct task_struct *p, bool task_sleep)
++{
++	long last_ewma_diff;
++	unsigned int last_util, ewma;
++
++	/* Задача не закончила активацию (миграция, смена класса): не обновляем */
++	if (!task_sleep)
++		return;
++
++	ewma = p->se.avg.util_est.ewma;
++	last_util = task_util(p);
++	last_ewma_diff = (long)last_util - (long)ewma;
++
++	/* Среднее уже в пределах ~1% от последней активации */
++	if (util_est_within_margin(last_ewma_diff, SCHED_CAPACITY_SCALE / 100))
++		return;
++
++	ewma <<= UTIL_EST_WEIGHT_SHIFT;
++	ewma += last_ewma_diff;
++	ewma >>= UTIL_EST_WEIGHT_SHIFT;
++	WRITE_ONCE(p->se.avg.util_est.enqueued, last_util);
++	WRITE_ONCE(p->se.avg.util_est.ewma, ewma);
++}
++#else
++static inline void util_est_enqueue(struct cfs_rq *cfs_rq, struct task_struct *p) {}
++static inline void util_est_dequeue(struct cfs_rq *cfs_rq, struct task_struct *p) {}
++static inline void util_est_update(struct task_struct *p, bool task_sleep) {}
++#endif /* CONFIG_SMP */
++
+ /*
+  * The enqueue_task method is called before nr_running is
+  * increased. Here we update the fair scheduling stats and
+@@ -5039,6 +5109,9 @@
+ #ifdef CONFIG_SCHED_WALT
+ 	p->misfit = !task_fits_max(p, rq->cpu);
+ #endif
++	/* util_est: до любого обновления частоты ниже */
++	util_est_enqueue(&rq->cfs, p);
++
+ 	/*
+ 	 * If in_iowait is set, the code below may not trigger any cpufreq
+ 	 * utilization updates, so do it here explicitly with the IOWAIT flag
+@@ -5130,6 +5203,9 @@
+ 	struct sched_entity *se = &p->se;
+ 	int task_sleep = flags & DEQUEUE_SLEEP;
+ 
++	/* util_est: убрать оценку задачи до пересчёта частоты в dequeue_entity */
++	util_est_dequeue(&rq->cfs, p);
++
+ 	for_each_sched_entity(se) {
+ 		cfs_rq = cfs_rq_of(se);
+ 		dequeue_entity(cfs_rq, se, flags);
+@@ -5190,6 +5266,8 @@
+ 
+ #endif /* CONFIG_SMP */
+ 
++	util_est_update(p, task_sleep);
++
+ 	hrtick_update(rq);
+ }
+ 
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -1982,6 +1982,10 @@
+ 	u64 util = rq->cfs.avg.util_avg;
+ 	unsigned long capacity = capacity_orig_of(cpu);
+ 
++	/* util_est: не ниже оценки по прошлым активациям поставленных в очередь задач */
++	if (sysctl_sched_util_est)
++		util = max_t(u64, util, READ_ONCE(rq->cfs.avg.util_est.enqueued));
++
+ 	util *= (100 + per_cpu(sched_load_boost, cpu));
+ 	do_div(util, 100);
+ 
+diff --git a/kernel/sysctl.c b/kernel/sysctl.c
+--- a/kernel/sysctl.c
++++ b/kernel/sysctl.c
+@@ -406,6 +406,17 @@
+ 		.proc_handler   = proc_dointvec,
+ 	},
+ #endif
++#ifdef CONFIG_SMP
++	{
++		.procname	= "sched_util_est",
++		.data		= &sysctl_sched_util_est,
++		.maxlen		= sizeof(unsigned int),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec_minmax,
++		.extra1		= &zero,
++		.extra2		= &one,
++	},
++#endif
+ #ifdef CONFIG_SCHED_WALT
+ 	{
+ 		.procname       = "sched_cpu_high_irqload",

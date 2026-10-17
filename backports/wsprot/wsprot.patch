@@ -1,0 +1,65 @@
+diff --git a/include/linux/swap.h b/include/linux/swap.h
+--- a/include/linux/swap.h
++++ b/include/linux/swap.h
+@@ -338,6 +338,7 @@
+ 						unsigned long *nr_scanned);
+ extern unsigned long shrink_all_memory(unsigned long nr_pages);
+ extern int vm_swappiness;
++extern unsigned int sysctl_file_protect_kbytes;
+ extern int sysctl_swap_ratio;
+ extern int sysctl_swap_ratio_enable;
+ extern int remove_mapping(struct address_space *mapping, struct page *page);
+diff --git a/kernel/sysctl.c b/kernel/sysctl.c
+--- a/kernel/sysctl.c
++++ b/kernel/sysctl.c
+@@ -1605,6 +1605,14 @@
+ 		.proc_handler   = pdflush_proc_obsolete,
+ 	},
+ 	{
++		.procname	= "file_protect_kbytes",
++		.data		= &sysctl_file_protect_kbytes,
++		.maxlen		= sizeof(unsigned int),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec_minmax,
++		.extra1		= &zero,
++	},
++	{
+ 		.procname	= "swappiness",
+ 		.data		= &vm_swappiness,
+ 		.maxlen		= sizeof(vm_swappiness),
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -151,6 +151,8 @@
+  * From 0 .. 100.  Higher means more swappy.
+  */
+ int vm_swappiness = 60;
++/* KKNX wsprotect: пока файловых страниц не больше этого (КБ), глобальный reclaim не трогает их, а берёт anon (в zram); 0 = выключено */
++unsigned int sysctl_file_protect_kbytes;
+ /*
+  * The total number of pages which are beyond the high watermark within all
+  * zones.
+@@ -2246,6 +2248,23 @@
+ 	}
+ 
+ 	/*
++	 * KKNX wsprotect: рабочий набор файлового кэша не вытесняем, пока он
++	 * не больше порога vm.file_protect_kbytes; освобождаем anon (в zram).
++	 * Под сильным давлением (priority < 3) защита снимается.
++	 */
++	if (global_reclaim(sc) && swappiness && sc->priority >= 3 &&
++	    READ_ONCE(sysctl_file_protect_kbytes)) {
++		unsigned long wsfile = node_page_state(pgdat, NR_ACTIVE_FILE) +
++				       node_page_state(pgdat, NR_INACTIVE_FILE);
++
++		if (wsfile <= ((unsigned long)READ_ONCE(sysctl_file_protect_kbytes) >>
++			       (PAGE_SHIFT - 10))) {
++			scan_balance = SCAN_ANON;
++			goto out;
++		}
++	}
++
++	/*
+ 	 * Prevent the reclaimer from falling into the cache trap: as
+ 	 * cache pages start out inactive, every cache fault will tip
+ 	 * the scan balance towards the file LRU.  And as the file LRU

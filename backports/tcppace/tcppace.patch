@@ -1,0 +1,252 @@
+diff --git a/include/linux/tcp.h b/include/linux/tcp.h
+index ff496573f..d371d034c 100644
+--- a/include/linux/tcp.h
++++ b/include/linux/tcp.h
+@@ -292,6 +292,8 @@ struct tcp_sock {
+ 	u32	sacked_out;	/* SACK'd packets			*/
+ 	u32	fackets_out;	/* FACK'd packets			*/
+ 
++	struct hrtimer	pacing_timer;
++
+ 	/* from STCP, retrans queue hinting */
+ 	struct sk_buff* lost_skb_hint;
+ 	struct sk_buff *retransmit_skb_hint;
+diff --git a/include/net/sock.h b/include/net/sock.h
+index e850b221c..64e043fc1 100644
+--- a/include/net/sock.h
++++ b/include/net/sock.h
+@@ -250,6 +250,7 @@ struct sock_common {
+   *	@sk_ll_usec: usecs to busypoll when there is no data
+   *	@sk_allocation: allocation mode
+   *	@sk_pacing_rate: Pacing rate (if supported by transport/packet scheduler)
++  *	@sk_pacing_status: Pacing status (requested, handled by sch_fq)
+   *	@sk_max_pacing_rate: Maximum pacing rate (%SO_MAX_PACING_RATE)
+   *	@sk_sndbuf: size of send buffer in bytes
+   *	@sk_padding: unused element for alignment
+@@ -404,6 +405,7 @@ struct sock {
+ 	gfp_t			sk_allocation;
+ 	u32			sk_pacing_rate; /* bytes per second */
+ 	u32			sk_max_pacing_rate;
++	u32			sk_pacing_status; /* see enum sk_pacing */
+ 	netdev_features_t	sk_route_caps;
+ 	netdev_features_t	sk_route_nocaps;
+ 	int			sk_gso_type;
+@@ -457,6 +459,12 @@ struct sock {
+ 	struct rcu_head		sk_rcu;
+ };
+ 
++enum sk_pacing {
++	SK_PACING_NONE		= 0,
++	SK_PACING_NEEDED	= 1,
++	SK_PACING_FQ		= 2,
++};
++
+ #define __sk_user_data(sk) ((*((void __rcu **)&(sk)->sk_user_data)))
+ 
+ #define rcu_dereference_sk_user_data(sk)	rcu_dereference(__sk_user_data((sk)))
+diff --git a/include/net/tcp.h b/include/net/tcp.h
+index a65d01da7..e4d2bd607 100644
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@ -600,6 +600,7 @@ void tcp_check_space(struct sock *sk);
+ void tcp_init_xmit_timers(struct sock *);
+ static inline void tcp_clear_xmit_timers(struct sock *sk)
+ {
++	hrtimer_cancel(&tcp_sk(sk)->pacing_timer);
+ 	inet_csk_clear_xmit_timers(sk);
+ }
+ 
+@@ -1993,4 +1994,6 @@ static inline void tcp_listendrop(const struct sock *sk)
+ 	__NET_INC_STATS(sock_net(sk), LINUX_MIB_LISTENDROPS);
+ }
+ 
++enum hrtimer_restart tcp_pace_kick(struct hrtimer *timer);
++
+ #endif	/* _TCP_H */
+diff --git a/net/core/sock.c b/net/core/sock.c
+index 0410b74e7..58a8607a4 100644
+--- a/net/core/sock.c
++++ b/net/core/sock.c
+@@ -989,6 +989,10 @@ int sock_setsockopt(struct socket *sock, int level, int optname,
+ #endif
+ 
+ 	case SO_MAX_PACING_RATE:
++		if (val != ~0U)
++			cmpxchg(&sk->sk_pacing_status,
++				SK_PACING_NONE,
++				SK_PACING_NEEDED);
+ 		sk->sk_max_pacing_rate = val;
+ 		sk->sk_pacing_rate = min(sk->sk_pacing_rate,
+ 					 sk->sk_max_pacing_rate);
+diff --git a/net/ipv4/tcp_bbr.c b/net/ipv4/tcp_bbr.c
+index 47f40e105..250342413 100644
+--- a/net/ipv4/tcp_bbr.c
++++ b/net/ipv4/tcp_bbr.c
+@@ -22,10 +22,9 @@
+  * There is a public e-mail list for discussing BBR development and testing:
+  *   https://groups.google.com/forum/#!forum/bbr-dev
+  *
+- * NOTE: BBR *must* be used with the fq qdisc ("man tc-fq") with pacing enabled,
+- * since pacing is integral to the BBR design and implementation.
+- * BBR without pacing would not function properly, and may incur unnecessary
+- * high packet loss rates.
++ * NOTE: BBR might be used with the fq qdisc ("man tc-fq") with pacing enabled,
++ * otherwise TCP stack falls back to an internal pacing using one high
++ * resolution timer per TCP socket and may use more resources.
+  */
+ #include <linux/module.h>
+ #include <net/tcp.h>
+@@ -835,6 +834,8 @@ static void bbr_init(struct sock *sk)
+ 	bbr->cycle_idx = 0;
+ 	bbr_reset_lt_bw_sampling(sk);
+ 	bbr_reset_startup_mode(sk);
++
++	cmpxchg(&sk->sk_pacing_status, SK_PACING_NONE, SK_PACING_NEEDED);
+ }
+ 
+ static u32 bbr_sndbuf_expand(struct sock *sk)
+diff --git a/net/ipv4/tcp_output.c b/net/ipv4/tcp_output.c
+index 67b391620..a613c4a44 100644
+--- a/net/ipv4/tcp_output.c
++++ b/net/ipv4/tcp_output.c
+@@ -903,6 +903,64 @@ void tcp_wfree(struct sk_buff *skb)
+ 	sk_free(sk);
+ }
+ 
++/* Note: Called under hard irq.
++ * We can not call TCP stack right away.
++ * KKNX: вариант под модель TSQ ядра 4.9 (tsq_flags + битовые операции, без sk_tsq_flags из 4.13).
++ */
++enum hrtimer_restart tcp_pace_kick(struct hrtimer *timer)
++{
++	struct tcp_sock *tp = container_of(timer, struct tcp_sock, pacing_timer);
++	struct sock *sk = (struct sock *)tp;
++
++	if (!test_and_set_bit(TSQ_QUEUED, &tp->tsq_flags)) {
++		struct tsq_tasklet *tsq;
++		bool empty;
++
++		clear_bit(TSQ_THROTTLED, &tp->tsq_flags);
++		if (atomic_inc_not_zero(&sk->sk_wmem_alloc)) {
++			/* queue this socket to tasklet queue (hard irq: прерывания уже выключены) */
++			tsq = this_cpu_ptr(&tsq_tasklet);
++			empty = list_empty(&tsq->head);
++			list_add(&tp->tsq_node, &tsq->head);
++			if (empty)
++				tasklet_schedule(&tsq->tasklet);
++		}
++	}
++	return HRTIMER_NORESTART;
++}
++
++/* BBR congestion control needs pacing.
++ * Same remark for SO_MAX_PACING_RATE.
++ * sch_fq packet scheduler is efficiently handling pacing,
++ * but is not always installed/used.
++ * Return true if TCP stack should pace packets itself.
++ */
++static bool tcp_needs_internal_pacing(const struct sock *sk)
++{
++	return smp_load_acquire(&sk->sk_pacing_status) == SK_PACING_NEEDED;
++}
++
++static void tcp_internal_pacing(struct sock *sk, const struct sk_buff *skb)
++{
++	u64 len_ns;
++	u32 rate;
++
++	if (!tcp_needs_internal_pacing(sk))
++		return;
++	rate = sk->sk_pacing_rate;
++	if (!rate || rate == ~0U)
++		return;
++
++	/* Should account for header sizes as sch_fq does,
++	 * but lets make things simple.
++	 */
++	len_ns = (u64)skb->len * NSEC_PER_SEC;
++	do_div(len_ns, rate);
++	hrtimer_start(&tcp_sk(sk)->pacing_timer,
++		      ktime_add_ns(ktime_get(), len_ns),
++		      HRTIMER_MODE_ABS_PINNED);
++}
++
+ /* This routine actually transmits TCP packets queued in by
+  * tcp_do_sendmsg().  This is used by both the initial
+  * transmission and possible later retransmissions.
+@@ -1024,6 +1082,7 @@ static int __tcp_transmit_skb(struct sock *sk, struct sk_buff *skb,
+ 	if (skb->len != tcp_header_size) {
+ 		tcp_event_data_sent(tp, sk);
+ 		tp->data_segs_out += tcp_skb_pcount(skb);
++		tcp_internal_pacing(sk, skb);
+ 	}
+ 
+ 	if (after(tcb->end_seq, tp->snd_nxt) || tcb->seq == tcb->end_seq)
+@@ -2121,6 +2180,12 @@ static int tcp_mtu_probe(struct sock *sk)
+ 	return -1;
+ }
+ 
++static bool tcp_pacing_check(const struct sock *sk)
++{
++	return tcp_needs_internal_pacing(sk) &&
++	       hrtimer_active(&tcp_sk(sk)->pacing_timer);
++}
++
+ /* TCP Small Queues :
+  * Control number of packets in qdisc/devices to two packets / or ~1 ms.
+  * (These limits are doubled for retransmits)
+@@ -2195,6 +2260,9 @@ static bool tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
+ 	while ((skb = tcp_send_head(sk))) {
+ 		unsigned int limit;
+ 
++		if (tcp_pacing_check(sk))
++			break;
++
+ 		tso_segs = tcp_init_tso_segs(skb, mss_now);
+ 		BUG_ON(!tso_segs);
+ 
+@@ -2917,6 +2985,10 @@ void tcp_xmit_retransmit_queue(struct sock *sk)
+ 
+ 		if (skb == tcp_send_head(sk))
+ 			break;
++
++		if (tcp_pacing_check(sk))
++			break;
++
+ 		/* we could do better than to assign each time */
+ 		if (!hole)
+ 			tp->retransmit_skb_hint = skb;
+diff --git a/net/ipv4/tcp_timer.c b/net/ipv4/tcp_timer.c
+index 95ee06948..7f52cd2ae 100644
+--- a/net/ipv4/tcp_timer.c
++++ b/net/ipv4/tcp_timer.c
+@@ -757,4 +757,7 @@ void tcp_init_xmit_timers(struct sock *sk)
+ {
+ 	inet_csk_init_xmit_timers(sk, &tcp_write_timer, &tcp_delack_timer,
+ 				  &tcp_keepalive_timer);
++	hrtimer_init(&tcp_sk(sk)->pacing_timer, CLOCK_MONOTONIC,
++		     HRTIMER_MODE_ABS_PINNED);
++	tcp_sk(sk)->pacing_timer.function = tcp_pace_kick;
+ }
+diff --git a/net/sched/sch_fq.c b/net/sched/sch_fq.c
+index 9f53d4ec0..3a1790f2e 100644
+--- a/net/sched/sch_fq.c
++++ b/net/sched/sch_fq.c
+@@ -405,9 +405,17 @@ static int fq_enqueue(struct sk_buff *skb, struct Qdisc *sch,
+ 		q->stat_tcp_retrans++;
+ 	qdisc_qstats_backlog_inc(sch, skb);
+ 	if (fq_flow_is_detached(f)) {
++		struct sock *sk = skb->sk;
++
+ 		fq_flow_add_tail(&q->new_flows, f);
+ 		if (time_after(jiffies, f->age + q->flow_refill_delay))
+ 			f->credit = max_t(u32, f->credit, q->quantum);
++		if (sk && q->rate_enable) {
++			if (unlikely(smp_load_acquire(&sk->sk_pacing_status) !=
++				     SK_PACING_FQ))
++				smp_store_release(&sk->sk_pacing_status,
++						  SK_PACING_FQ);
++		}
+ 		q->inactive_flows--;
+ 	}
+ 

@@ -1,0 +1,249 @@
+diff --git a/drivers/block/zram/zram_drv.c b/drivers/block/zram/zram_drv.c
+index 1977f15ba..227d56251 100644
+--- a/drivers/block/zram/zram_drv.c
++++ b/drivers/block/zram/zram_drv.c
+@@ -1985,7 +1989,7 @@ static int zram_add(void)
+ 	queue_flag_set_unlocked(QUEUE_FLAG_DISCARD, zram->disk->queue);
+ 
+ 	zram->disk->queue->backing_dev_info->capabilities |=
+-					BDI_CAP_STABLE_WRITES;
++			(BDI_CAP_STABLE_WRITES | BDI_CAP_SYNCHRONOUS_IO);
+ 
+ 	disk_to_dev(zram->disk)->groups = zram_disk_attr_groups;
+ 	add_disk(zram->disk);
+diff --git a/include/linux/backing-dev.h b/include/linux/backing-dev.h
+index 01602a747..1e9f95efa 100644
+--- a/include/linux/backing-dev.h
++++ b/include/linux/backing-dev.h
+@@ -164,6 +164,7 @@ int bdi_set_max_ratio(struct backing_dev_info *bdi, unsigned int max_ratio);
+ #define BDI_CAP_STABLE_WRITES	0x00000008
+ #define BDI_CAP_STRICTLIMIT	0x00000010
+ #define BDI_CAP_CGROUP_WRITEBACK 0x00000020
++#define BDI_CAP_SYNCHRONOUS_IO	0x00000040
+ 
+ #define BDI_CAP_NO_ACCT_AND_WRITEBACK \
+ 	(BDI_CAP_NO_WRITEBACK | BDI_CAP_NO_ACCT_DIRTY | BDI_CAP_NO_ACCT_WB)
+@@ -216,6 +217,11 @@ static inline bool bdi_cap_stable_pages_required(struct backing_dev_info *bdi)
+ 	return bdi->capabilities & BDI_CAP_STABLE_WRITES;
+ }
+ 
++static inline bool bdi_cap_synchronous_io(struct backing_dev_info *bdi)
++{
++	return bdi->capabilities & BDI_CAP_SYNCHRONOUS_IO;
++}
++
+ static inline bool bdi_cap_writeback_dirty(struct backing_dev_info *bdi)
+ {
+ 	return !(bdi->capabilities & BDI_CAP_NO_WRITEBACK);
+diff --git a/include/linux/swap.h b/include/linux/swap.h
+index 866a89205..a14768125 100644
+--- a/include/linux/swap.h
++++ b/include/linux/swap.h
+@@ -152,8 +152,9 @@ enum {
+ 	SWP_PAGE_DISCARD = (1 << 9),	/* freed swap page-cluster discards */
+ 	SWP_STABLE_WRITES = (1 << 10),	/* no overwrite PG_writeback pages */
+ 	SWP_FAST	= (1 << 11),	/* blkdev access is fast and cheap */
++	SWP_SYNCHRONOUS_IO = (1 << 12),	/* synchronous IO is efficient */
+ 					/* add others here before... */
+-	SWP_SCANNING	= (1 << 12),	/* refcount in scan_swap_map */
++	SWP_SCANNING	= (1 << 13),	/* refcount in scan_swap_map */
+ };
+ 
+ #define SWAP_CLUSTER_MAX 32UL
+@@ -432,6 +433,8 @@ extern sector_t swapdev_block(int, pgoff_t);
+ extern int page_swapcount(struct page *);
+ extern int swp_swapcount(swp_entry_t entry);
+ extern struct swap_info_struct *page_swap_info(struct page *);
++extern struct swap_info_struct *swp_swap_info(swp_entry_t entry);
++extern int __swap_count(struct swap_info_struct *si, swp_entry_t entry);
+ extern bool reuse_swap_page(struct page *, int *);
+ extern int try_to_free_swap(struct page *);
+ struct backing_dev_info;
+diff --git a/mm/memory.c b/mm/memory.c
+index 55be7a88c..9d5a79375 100755
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -2745,13 +2745,14 @@ EXPORT_SYMBOL(unmap_mapping_range);
+ int do_swap_page(struct fault_env *fe, pte_t orig_pte)
+ {
+ 	struct vm_area_struct *vma = fe->vma;
+-	struct page *page, *swapcache;
++	struct page *page, *swapcache = NULL;
+ 	struct mem_cgroup *memcg;
+ 	swp_entry_t entry;
+ 	pte_t pte;
+ 	int locked;
+ 	int exclusive = 0;
+ 	int ret = 0;
++	bool need_clear_cache = false;
+ 
+ 	ret = pte_unmap_same(vma->vm_mm, fe, orig_pte);
+ 	if (ret) {
+@@ -2778,9 +2779,41 @@ int do_swap_page(struct fault_env *fe, pte_t orig_pte)
+ 	}
+ 	delayacct_set_flag(DELAYACCT_PF_SWAPIN);
+ 	page = lookup_swap_cache(entry);
++	swapcache = page;
+ 	if (!page) {
+-		page = swapin_readahead(entry,
+-					GFP_HIGHUSER_MOVABLE, vma, fe->address);
++		struct swap_info_struct *si = swp_swap_info(entry);
++
++		if ((si->flags & SWP_SYNCHRONOUS_IO) &&
++		    __swap_count(si, entry) == 1) {
++			/* KKNX (Linux 4.15): swap cache пропускаем, читаем прямо в новую страницу */
++			/*
++			 * KKNX (Linux 6.8, 13ddaf26be32): держим SWAP_HAS_CACHE на слоте, пока
++			 * читаем и мапим. Иначе параллельный swap-in того же слота успеет
++			 * закончить, освободить слот, выселить страницу в тот же слот, и
++			 * pte_same() этого не заметит (ABA). Заодно слот не уйдёт под swapoff.
++			 * Проигравший ждёт тик и заходит в fault заново.
++			 */
++			if (swapcache_prepare(entry)) {
++				delayacct_clear_flag(DELAYACCT_PF_SWAPIN);
++				schedule_timeout_uninterruptible(1);
++				goto out;
++			}
++			need_clear_cache = true;
++
++			page = alloc_page_vma(GFP_HIGHUSER_MOVABLE, vma,
++					      fe->address);
++			if (page) {
++				__SetPageLocked(page);
++				__SetPageSwapBacked(page);
++				set_page_private(page, entry.val);
++				lru_cache_add_anon(page);
++				swap_readpage(page);
++			}
++		} else {
++			page = swapin_readahead(entry, GFP_HIGHUSER_MOVABLE,
++						vma, fe->address);
++			swapcache = page;
++		}
+ 		if (!page) {
+ 			/*
+ 			 * Back out if the VMA has changed in our back during
+@@ -2814,7 +2847,6 @@ int do_swap_page(struct fault_env *fe, pte_t orig_pte)
+ 		goto out_release;
+ 	}
+ 
+-	swapcache = page;
+ 	locked = lock_page_or_retry(page, vma->vm_mm, fe->flags);
+ 
+ 	delayacct_clear_flag(DELAYACCT_PF_SWAPIN);
+@@ -2829,7 +2861,8 @@ int do_swap_page(struct fault_env *fe, pte_t orig_pte)
+ 	 * test below, are not enough to exclude that.  Even if it is still
+ 	 * swapcache, we need to check that the page's swap has not changed.
+ 	 */
+-	if (unlikely(!PageSwapCache(page) || page_private(page) != entry.val))
++	if (unlikely((!PageSwapCache(page) ||
++		      page_private(page) != entry.val)) && swapcache)
+ 		goto out_page;
+ 
+ 	page = ksm_might_need_to_copy(page, vma, fe->address);
+@@ -2884,7 +2917,8 @@ int do_swap_page(struct fault_env *fe, pte_t orig_pte)
+ 	if (pte_swp_soft_dirty(orig_pte))
+ 		pte = pte_mksoft_dirty(pte);
+ 	set_pte_at(vma->vm_mm, fe->address, fe->pte, pte);
+-	if (page == swapcache) {
++	if (page == swapcache || !swapcache) {
++		/* !swapcache: страница уже на LRU (lru_cache_add_anon), lrucare = true */
+ 		do_page_add_anon_rmap(page, vma, fe->address, exclusive);
+ 		mem_cgroup_commit_charge(page, memcg, true, false);
+ 		activate_page(page);
+@@ -2899,7 +2933,7 @@ int do_swap_page(struct fault_env *fe, pte_t orig_pte)
+ 	    (fe->vma_flags & VM_LOCKED) || PageMlocked(page))
+ 		try_to_free_swap(page);
+ 	unlock_page(page);
+-	if (page != swapcache) {
++	if (page != swapcache && swapcache) {
+ 		/*
+ 		 * Hold the lock to avoid the swap entry to be reused
+ 		 * until we take the PT lock for the pte_same() check
+@@ -2924,6 +2958,9 @@ int do_swap_page(struct fault_env *fe, pte_t orig_pte)
+ unlock:
+ 	pte_unmap_unlock(fe->pte, fe->ptl);
+ out:
++	/* после swap_free(): слот освободится здесь, если на него больше никто не ссылается */
++	if (need_clear_cache)
++		swapcache_free(entry);
+ 	return ret;
+ out_nomap:
+ 	pte_unmap_unlock(fe->pte, fe->ptl);
+@@ -2933,10 +2970,12 @@ int do_swap_page(struct fault_env *fe, pte_t orig_pte)
+ 	unlock_page(page);
+ out_release:
+ 	put_page(page);
+-	if (page != swapcache) {
++	if (page != swapcache && swapcache) {
+ 		unlock_page(swapcache);
+ 		put_page(swapcache);
+ 	}
++	if (need_clear_cache)
++		swapcache_free(entry);
+ 	return ret;
+ }
+ 
+diff --git a/mm/page_io.c b/mm/page_io.c
+index 7a39aed0c..c0b3c0a6d 100644
+--- a/mm/page_io.c
++++ b/mm/page_io.c
+@@ -335,7 +335,9 @@ int swap_readpage(struct page *page)
+ 	struct swap_info_struct *sis = page_swap_info(page);
+ 	unsigned long pflags;
+ 
+-	VM_BUG_ON_PAGE(!PageSwapCache(page), page);
++	/* без swap cache страницу читает только do_swap_page() для SWP_SYNCHRONOUS_IO */
++	VM_BUG_ON_PAGE(!PageSwapCache(page) &&
++		       !(sis->flags & SWP_SYNCHRONOUS_IO), page);
+ 	VM_BUG_ON_PAGE(!PageLocked(page), page);
+ 	VM_BUG_ON_PAGE(PageUptodate(page), page);
+ 
+diff --git a/mm/swapfile.c b/mm/swapfile.c
+index 2c6c23dee..88aa32d40 100644
+--- a/mm/swapfile.c
++++ b/mm/swapfile.c
+@@ -2527,6 +2527,9 @@ SYSCALL_DEFINE2(swapon, const char __user *, specialfile, int, swap_flags)
+ 	if (bdi_cap_stable_pages_required(inode_to_bdi(inode)))
+ 		p->flags |= SWP_STABLE_WRITES;
+ 
++	if (bdi_cap_synchronous_io(inode_to_bdi(inode)))
++		p->flags |= SWP_SYNCHRONOUS_IO;
++
+ 	if (p->bdev && blk_queue_nonrot(bdev_get_queue(p->bdev))) {
+ 		int cpu;
+ 
+@@ -2799,10 +2802,32 @@ int swapcache_prepare(swp_entry_t entry)
+ 	return __swap_duplicate(entry, SWAP_HAS_CACHE);
+ }
+ 
++struct swap_info_struct *swp_swap_info(swp_entry_t entry)
++{
++	return swap_info[swp_type(entry)];
++}
++
+ struct swap_info_struct *page_swap_info(struct page *page)
+ {
+ 	swp_entry_t swap = { .val = page_private(page) };
+-	return swap_info[swp_type(swap)];
++	return swp_swap_info(swap);
++}
++
++/*
++ * KKNX (Linux 4.15): счётчик ссылок на слот без swap cache.
++ * Читаем под si->lock: swapoff обнуляет max и swap_map под этим же замком,
++ * после чего возвращаем 0 и вызывающий идёт обычным путём через swapin_readahead().
++ */
++int __swap_count(struct swap_info_struct *si, swp_entry_t entry)
++{
++	pgoff_t offset = swp_offset(entry);
++	int count = 0;
++
++	spin_lock(&si->lock);
++	if (si->swap_map && offset < si->max)
++		count = swap_count(si->swap_map[offset]);
++	spin_unlock(&si->lock);
++	return count;
+ }
+ 
+ /*
