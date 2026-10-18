@@ -150,7 +150,7 @@ def rebuild_levels(node, freqs):
 
 def tune_gpu():
     freqs = env_list("GPU_FREQS", [904, 560, 510, 400, 320])
-    fmax = env_list("GPU_CORNER_FMAX", [280, 369, 510, 637, 921])
+    fmax = env_list("GPU_CORNER_FMAX", [280, 369, 510, 560, 921])
     top_pll = env_list("GPU_TOP_PLL_MHZ", [])
     if top_pll and not (700 <= top_pll[0] <= 1808):
         die(f"GPU_TOP_PLL_MHZ={top_pll[0]}: допустимо 700..1808 МГц (VCO PLL и fmax gpll3)")
