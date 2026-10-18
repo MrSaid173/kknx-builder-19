@@ -30,6 +30,7 @@ REG_DTSI = [DTS / "sdm439-regulator-olive.dtsi", DTS / "sdm439-regulator.dtsi"]
 # ---- пределы безопасности (можно ослабить, но это осознанное решение) ----
 GPLL3_MAX_OUT_MHZ = 904        # fmax gpll3 = 1808 МГц, делитель /2 -> 904 МГц на выходе
 GPLL3_MIN_OUT_MHZ = 350        # VCO min 700 МГц
+GPU_MAX_ACTIVE_LEVELS = 9        # KGSL_MAX_PWRLEVELS = 10, один уровень занят под XO (19,2 МГц)
 GPLL3_LOW_MIN_OUT_MHZ = 175    # ниже 350: PLL = 4 x частота (делитель 2), VCO min 700 МГц
 CPU_UV_MIN, CPU_UV_MAX = -150, 75
 CEIL_MIN_MV, CEIL_MAX_MV = 600, 1050
@@ -75,6 +76,78 @@ F_SLEW_RE = re.compile(
     r"\s*(?P<div>[\d.]+),\s*(?P<m>\d+),\s*(?P<n>\d+)\),\s*$")
 
 
+def _interp(points, x):
+    """Линейная интерполяция по точкам (x, y); за краями продолжаем крайний отрезок."""
+    pts = sorted(points)
+    if x >= pts[-1][0]:
+        return pts[-1][1]
+    if x <= pts[0][0]:
+        (x0, y0), (x1, y1) = pts[0], pts[1]
+    else:
+        for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+            if x0 <= x <= x1:
+                break
+    return y0 + (y1 - y0) * (x - x0) / (x1 - x0)
+
+
+def rebuild_levels(node, freqs):
+    """Узел qcom,gpu-pwrlevels-N: вместо 5 рабочих уровней делает len(freqs).
+    Значения шины памяти (bus-freq/min/max) берутся интерполяцией по исходным 5 уровням."""
+    lv = list(re.finditer(r"qcom,gpu-pwrlevel@(\d+) \{(.*?)\n[ \t]*\};", node, re.S))
+    first = re.search(r"\n([ \t]*)(?:/\*[^\n]*\*/\n[ \t]*)?qcom,gpu-pwrlevel@0 \{", node)
+    if not lv or not first:
+        die("pwrlevels: не удалось разобрать уровни GPU")
+    ind = first.group(1)
+    levels = []
+    for m in lv:
+        body = m.group(2)
+
+        def g(k, body=body):
+            return int(re.search(r"qcom,%s = <(\d+)>;" % k, body)[1])
+        levels.append(dict(hz=g("gpu-freq"), bus=g("bus-freq"), bmin=g("bus-min"), bmax=g("bus-max")))
+    act = [l for l in levels if l["hz"] > 100_000_000]
+    idle = [l for l in levels if l["hz"] <= 100_000_000]
+    if len(act) != 5:
+        die("pwrlevels: ожидалось 5 рабочих уровней в исходном узле")
+    if len(freqs) + len(idle) > 10:
+        die("pwrlevels: уровней больше KGSL_MAX_PWRLEVELS (10)")
+
+    xs = [l["hz"] / 1e6 for l in act]
+    xs[0] = max(xs[0], freqs[0])        # верхняя метка в исходнике может быть ниже новой (650/870 -> 904)
+
+    def pick(key, x, hi):
+        v = _interp([(xx, l[key]) for xx, l in zip(xs, act)], x)
+        return max(1, min(hi, int(v + 0.5 + 1e-9)))
+    top = {k: max(l[k] for l in act) for k in ("bus", "bmin", "bmax")}
+    rows = []
+    for f in freqs:
+        b = pick("bus", f, top["bus"])
+        bn = pick("bmin", f, top["bmin"])
+        bx = pick("bmax", f, top["bmax"])
+        rows.append((f, b, min(bn, b), max(bx, b)))
+
+    def lvl(i, comment, hz, b, bn, bx):
+        return (f"{ind}/* {comment} */\n{ind}qcom,gpu-pwrlevel@{i} {{\n{ind}\treg = <{i}>;\n"
+                f"{ind}\tqcom,gpu-freq = <{hz}>;\n{ind}\tqcom,bus-freq = <{b}>;\n"
+                f"{ind}\tqcom,bus-min = <{bn}>;\n{ind}\tqcom,bus-max = <{bx}>;\n{ind}}};")
+    parts = [lvl(i, f"{f} MHz", f * 1_000_000, b, bn, bx) for i, (f, b, bn, bx) in enumerate(rows)]
+    for k, l in enumerate(idle):
+        parts.append(lvl(len(rows) + k, "XO" if l["hz"] < 50_000_000 else "idle",
+                         l["hz"], l["bus"], l["bmin"], l["bmax"]))
+    block = "\n\n".join(parts)
+
+    new = node[:first.start() + 1] + block + node[lv[-1].end():]
+
+    # начальный уровень: ближайший по частоте к исходному
+    mi = re.search(r"qcom,initial-pwrlevel = <(\d+)>;", node)
+    if mi:
+        f0 = levels[int(mi.group(1))]["hz"] / 1e6
+        j = min(range(len(freqs)), key=lambda t: (abs(freqs[t] - f0), t))
+        new = new.replace(mi.group(0), f"qcom,initial-pwrlevel = <{j}>;", 1)
+    info("GPU уровни (МГц: bus/min/max): " + ", ".join(f"{f}: {b}/{bn}/{bx}" for f, b, bn, bx in rows))
+    return new
+
+
 def tune_gpu():
     freqs = env_list("GPU_FREQS", [904, 560, 510, 400, 320])
     fmax = env_list("GPU_CORNER_FMAX", [100, 320, 510, 560, 921])
@@ -82,8 +155,8 @@ def tune_gpu():
     if top_pll and not (700 <= top_pll[0] <= 1808):
         die(f"GPU_TOP_PLL_MHZ={top_pll[0]}: допустимо 700..1808 МГц (VCO PLL и fmax gpll3)")
 
-    if len(freqs) != 5:
-        die("GPU_FREQS: нужно ровно 5 значений (МГц), например 900,560,510,400,320")
+    if not (5 <= len(freqs) <= GPU_MAX_ACTIVE_LEVELS):
+        die(f"GPU_FREQS: нужно от 5 до {GPU_MAX_ACTIVE_LEVELS} значений (МГц), например 900,560,510,400,320")
     if any(a <= b for a, b in zip(freqs, freqs[1:])):
         die("GPU_FREQS: значения должны строго убывать")
     if len(fmax) != 5 or any(a >= b for a, b in zip(fmax, fmax[1:])):
@@ -169,6 +242,9 @@ def tune_gpu():
             # худших bin'ов (4/5/10) остаются как есть: там кристаллы хуже по качеству.
             if len(active) != 5:
                 return node
+            if len(freqs) != 5:
+                cnt += 1
+                return rebuild_levels(node, freqs)
             wanted = freqs
             it = iter(wanted)
             idx = {"i": -1}
