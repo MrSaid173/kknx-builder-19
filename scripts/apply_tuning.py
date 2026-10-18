@@ -30,6 +30,7 @@ REG_DTSI = [DTS / "sdm439-regulator-olive.dtsi", DTS / "sdm439-regulator.dtsi"]
 # ---- пределы безопасности (можно ослабить, но это осознанное решение) ----
 GPLL3_MAX_OUT_MHZ = 904        # fmax gpll3 = 1808 МГц, делитель /2 -> 904 МГц на выходе
 GPLL3_MIN_OUT_MHZ = 350        # VCO min 700 МГц
+GPLL3_LOW_MIN_OUT_MHZ = 175    # ниже 350: PLL = 4 x частота (делитель 2), VCO min 700 МГц
 CPU_UV_MIN, CPU_UV_MAX = -150, 75
 CEIL_MIN_MV, CEIL_MAX_MV = 600, 1050
 CPR_FLOORS_UV = [560000, 670000, 740000, 740000, 740000, 740000]  # floor по corner-map <1 2 3 3 3 3>
@@ -107,6 +108,9 @@ def tune_gpu():
 
     def synth(mhz, pll_mhz=None):
         hz = mhz * 1_000_000
+        if mhz < GPLL3_MIN_OUT_MHZ and not pll_mhz:
+            # частоты 175..349 МГц: PLL = 4 x частота, делитель 2 (например 288 -> PLL 1152)
+            return (hz, f"\tF_SLEW( {hz}, {4 * mhz * 1_000_000},\t  gpll3,\t2,\t0,\t0),", "gpll3")
         pll = (pll_mhz if pll_mhz else 2 * mhz) * 1_000_000
         return (hz, f"\tF_SLEW( {hz}, {pll},\t  gpll3,\t1,\t0,\t0),", "gpll3")
 
@@ -123,13 +127,13 @@ def tune_gpu():
             have.discard(hz)
         if hz in have:
             continue
-        if not (GPLL3_MIN_OUT_MHZ <= mhz <= GPLL3_MAX_OUT_MHZ):
+        if not (GPLL3_LOW_MIN_OUT_MHZ <= mhz <= GPLL3_MAX_OUT_MHZ):
             die(f"GPU {mhz} МГц: нет в таблице и вне диапазона gpll3 "
-                f"({GPLL3_MIN_OUT_MHZ}..{GPLL3_MAX_OUT_MHZ} МГц). Допустимы также уже имеющиеся "
+                f"({GPLL3_LOW_MIN_OUT_MHZ}..{GPLL3_MAX_OUT_MHZ} МГц). Допустимы также уже имеющиеся "
                 f"в таблице: {sorted(x // 1_000_000 for x in have if x >= 200_000_000)}")
         entries.append(synth(mhz, use_pll))
         have.add(hz)
-        info(f"GPU: добавлена запись {mhz} МГц (gpll3, PLL={use_pll or 2 * mhz} МГц)")
+        info(f"GPU: добавлена запись {mhz} МГц (gpll3, PLL={use_pll or (4 * mhz if mhz < GPLL3_MIN_OUT_MHZ else 2 * mhz)} МГц)")
 
     entries.sort(key=lambda e: e[0])
     new_body = "\n".join(e[1] for e in entries) + "\n"
